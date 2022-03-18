@@ -199,13 +199,22 @@ int sfe_cm_recv(struct sk_buff *skb)
  * structure, obtain the hardware address.  This means this function also
  * works if the neighbours are routers too.
  */
-static bool sfe_cm_find_dev_and_mac_addr(sfe_ip_addr_t *addr, struct net_device **dev, u8 *mac_addr, int is_v4)
+static bool sfe_cm_find_dev_and_mac_addr(struct sk_buff *skb, sfe_ip_addr_t *addr, struct net_device **dev, u8 *mac_addr, int is_v4)
 {
 	struct neighbour *neigh;
 	struct rtable *rt;
 	struct rt6_info *rt6;
 	struct dst_entry *dst;
 	struct net_device *mac_dev;
+
+	/*
+	 * If we have skb provided, use it as the original code is unable
+	 * to lookup routes that are policy routed.
+	*/
+	if (unlikely(skb)) {
+		dst = skb_dst(skb);
+		goto skip_dst_lookup;
+	}
 
 	/*
 	 * Look up the rtable entry for the IP address then get the hardware
@@ -232,18 +241,21 @@ static bool sfe_cm_find_dev_and_mac_addr(sfe_ip_addr_t *addr, struct net_device 
 		dst = (struct dst_entry *)rt6;
 	}
 
+skip_dst_lookup:
 	rcu_read_lock();
 	neigh = sfe_dst_get_neighbour(dst, addr);
 	if (unlikely(!neigh)) {
 		rcu_read_unlock();
-		dst_release(dst);
+		if (likely(!skb))
+			dst_release(dst);
 		goto ret_fail;
 	}
 
 	if (unlikely(!(neigh->nud_state & NUD_VALID))) {
 		rcu_read_unlock();
 		neigh_release(neigh);
-		dst_release(dst);
+		if (likely(!skb))
+			dst_release(dst);
 		goto ret_fail;
 	}
 
@@ -251,7 +263,8 @@ static bool sfe_cm_find_dev_and_mac_addr(sfe_ip_addr_t *addr, struct net_device 
 	if (!mac_dev) {
 		rcu_read_unlock();
 		neigh_release(neigh);
-		dst_release(dst);
+		if (likely(!skb))
+			dst_release(dst);
 		goto ret_fail;
 	}
 
@@ -261,7 +274,8 @@ static bool sfe_cm_find_dev_and_mac_addr(sfe_ip_addr_t *addr, struct net_device 
 	*dev = mac_dev;
 	rcu_read_unlock();
 	neigh_release(neigh);
-	dst_release(dst);
+	if (likely(!skb))
+		dst_release(dst);
 
 	return true;
 
@@ -295,7 +309,12 @@ static unsigned int sfe_cm_post_routing(struct sk_buff *skb, int is_v4)
 	struct net_device *dest_br_dev = NULL;
 	struct nf_conntrack_tuple orig_tuple;
 	struct nf_conntrack_tuple reply_tuple;
+	struct sk_buff *tmp_skb = NULL;
 	SFE_NF_CONN_ACCT(acct);
+	
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+    struct net *net=NULL;
+	#endif
 
 	/*
 	 * Don't process broadcast or multicast packets.
@@ -481,8 +500,12 @@ static unsigned int sfe_cm_post_routing(struct sk_buff *skb, int is_v4)
 		sic.dest_td_max_window = ct->proto.tcp.seen[1].td_maxwin;
 		sic.dest_td_end = ct->proto.tcp.seen[1].td_end;
 		sic.dest_td_max_end = ct->proto.tcp.seen[1].td_maxend;
-
-		if (nf_ct_tcp_no_window_check
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) 
+	net = nf_ct_net(ct);
+	if ((net&&net->ct.sysctl_no_window_check)
+#else
+	if (nf_ct_tcp_no_window_check
+#endif
 		    || (ct->proto.tcp.seen[0].flags & IP_CT_TCP_FLAG_BE_LIBERAL)
 		    || (ct->proto.tcp.seen[1].flags & IP_CT_TCP_FLAG_BE_LIBERAL)) {
 			sic.flags |= SFE_CREATE_FLAG_NO_SEQ_CHECK;
@@ -512,7 +535,7 @@ static unsigned int sfe_cm_post_routing(struct sk_buff *skb, int is_v4)
 			return NF_ACCEPT;
 		}
 		spin_unlock_bh(&ct->lock);
-		
+
 		/*
 		 * Somehow, SFE is not playing nice with IPSec traffic.
 		 * Do not accelerate for now.
@@ -581,25 +604,27 @@ static unsigned int sfe_cm_post_routing(struct sk_buff *skb, int is_v4)
 	 * Get the net device and MAC addresses that correspond to the various source and
 	 * destination host addresses.
 	 */
-	if (!sfe_cm_find_dev_and_mac_addr(&sic.src_ip, &src_dev_tmp, sic.src_mac, is_v4)) {
+	if (!sfe_cm_find_dev_and_mac_addr(NULL, &sic.src_ip, &src_dev_tmp, sic.src_mac, is_v4)) {
 		sfe_cm_incr_exceptions(SFE_CM_EXCEPTION_NO_SRC_DEV);
 		return NF_ACCEPT;
 	}
 	src_dev = src_dev_tmp;
 
-	if (!sfe_cm_find_dev_and_mac_addr(&sic.src_ip_xlate, &dev, sic.src_mac_xlate, is_v4)) {
+	if (!sfe_cm_find_dev_and_mac_addr(NULL, &sic.src_ip_xlate, &dev, sic.src_mac_xlate, is_v4)) {
 		sfe_cm_incr_exceptions(SFE_CM_EXCEPTION_NO_SRC_XLATE_DEV);
 		goto done1;
 	}
 	dev_put(dev);
-
-	if (!sfe_cm_find_dev_and_mac_addr(&sic.dest_ip, &dev, sic.dest_mac, is_v4)) {
+	/* Somehow, for IPv6, we need this workaround as well */
+	if (unlikely(!is_v4))
+		tmp_skb = skb;
+	if (!sfe_cm_find_dev_and_mac_addr(tmp_skb, &sic.dest_ip, &dev, sic.dest_mac, is_v4)) {
 		sfe_cm_incr_exceptions(SFE_CM_EXCEPTION_NO_DEST_DEV);
 		goto done1;
 	}
 	dev_put(dev);
 
-	if (!sfe_cm_find_dev_and_mac_addr(&sic.dest_ip_xlate, &dest_dev_tmp, sic.dest_mac_xlate, is_v4)) {
+	if (!sfe_cm_find_dev_and_mac_addr(skb, &sic.dest_ip_xlate, &dest_dev_tmp, sic.dest_mac_xlate, is_v4)) {
 		sfe_cm_incr_exceptions(SFE_CM_EXCEPTION_NO_DEST_XLATE_DEV);
 		goto done1;
 	}
@@ -917,7 +942,7 @@ static void sfe_cm_sync_rule(struct sfe_connection_sync *sis)
 #else
 				timeouts = nf_ct_timeout_lookup(ct);
 				if (!timeouts) {
-					timeouts = udp_get_timeouts(nf_ct_net(ct));
+					timeouts = nf_udp_pernet(nf_ct_net(ct))->timeouts;
 				}
 
 				spin_lock_bh(&ct->lock);
